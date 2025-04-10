@@ -1,0 +1,96 @@
+name: "gh-ejs-demo"
+on: 
+  schedule:
+    - cron: "30 8 * * *"  
+  workflow_dispatch:
+permissions:
+  id-token: write
+  contents: write
+  # required for all workflows
+  security-events: write
+  actions: read 
+  attestations: write    
+  packages: write  
+jobs:
+  gh-ejs-demo:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_REPO: 'ya-oci-dev-local'
+      IMAGE_NAME: 'ejs-demo:${{ github.run_number }}'
+      JF_URL: https://${{ vars.JF_HOST }}/
+      JF_PROJECT: ${{ vars.JF_PROJECT_KEY }}
+    outputs:
+      image:  ${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}
+      digest: ${{ steps.build.outputs.digest }}
+    # Here we install all the tools : docker buildx, QEMU, JDK 11, JFrog CLI
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      -
+        name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3      
+      - name: Install Node
+        uses: actions/setup-node@v3
+        with:
+            node-version: 18 
+      - name: Setup JFrog CLI
+        id: setup-cli
+        uses: jfrog/setup-jfrog-cli@v4
+        env:
+          JF_URL: https://${{ vars.JF_HOST }}/
+          JF_PROJECT: ${{ vars.JF_PROJECT_KEY }}
+        with:
+            oidc-provider-name: davidro-github-integration
+            oidc-audience: davidro-github
+      - name: Checkout the repository    
+        uses: actions/checkout@v4      
+      - name: NPM Audit 
+        run: |
+          jf rt bce 
+          jf npmc --repo-resolve dro-npm-remote
+          jf ca
+          jf npm cache clean --force
+          rm package-lock.json
+          jf npmc --repo-resolve dro-npm-unsecure-remote
+          jf npm i --omit dev 
+          jf audit --npm --fail=false
+      
+      - name: Authenticate Docker
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.JF_HOST }}
+          username: ${{ steps.setup-cli.outputs.oidc-user }}
+          password: ${{ steps.setup-cli.outputs.oidc-token }}
+      # docker image build
+      - name: Build and Push Docker image
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          push: true
+          provenance: true
+          platforms: linux/amd64 #, linux/arm64
+          tags: ${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}
+      - name: Publish build information
+        id: publish-build
+        run: |
+          echo "${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" > metadata.json
+          jf rt build-docker-create ${{ env.DOCKER_REPO }} --image-file metadata.json
+          jf rt bp
+      # docker xray scanning
+      - name: docker Info
+        id: docker-info
+        run: |  
+          echo "digest=$(docker images --no-trunc --quiet ${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }})" >> $GITHUB_OUTPUT
+          jf docker pull ${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }}
+          jf docker scan --fail=false  --threads=5 ${{ vars.JF_HOST }}/${{ env.DOCKER_REPO }}/${{ env.IMAGE_NAME }} --severity='HIGH,CRITICAL' --vuln --format=sarif > jfrog_docker_scan.sarif
+          sed -i s/"\"uri\": \"\""/"\"uri\": \"${{ vars.JF_URL }}\/${{ env.DOCKER_REPO }}\/${{ env.IMAGE_NAME }}:${{ github.run_number }}\""/g jfrog_docker_scan.sarif
+        # adding the built docker into the JFrog build info
+      - name: Upload output to generate autofix
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: jfrog_docker_scan.sarif
+      #- name: Scan build
+      #  id: scan-build  
+      #  run: |
+      #     jf build-scan --fail=false 
+      #     jf build-scan --fail=false --vuln
